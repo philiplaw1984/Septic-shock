@@ -1,0 +1,667 @@
+# ================================================================
+# 完整分析流程：Lasso-COX筛选 + 多因素COX + 生存曲线
+# 自动读取所有变量（无需手动输入）
+# 【关键修正】正确排除结局变量 Days_90 和 Death_90
+# ================================================================
+
+# ================================================================
+# Part 0: 加载必要的包
+# ================================================================
+
+packages <- c("readxl", "survival", "survminer", "dplyr", "ggplot2", "glmnet", "car")
+for (pkg in packages) {
+  if (!require(pkg, character.only = TRUE)) {
+    install.packages(pkg)
+    library(pkg, character.only = TRUE)
+  }
+}
+
+library(readxl)
+library(survival)
+library(survminer)
+library(dplyr)
+library(ggplot2)
+library(glmnet)
+library(car)
+
+cat("========== 所有包加载成功！ ==========\n\n")
+
+
+# ================================================================
+# Part 1: 读取数据
+# ================================================================
+
+df <- read_excel("DD3.xlsx", sheet = "Sheet1")
+
+cat("========== 数据读取成功 ==========\n")
+cat("原始数据维度:", dim(df), "\n")
+cat("所有列名:\n")
+print(colnames(df))
+cat("\n")
+
+
+# ================================================================
+# Part 2: 数据预处理（90天截断 + 剔除缺失值）
+# ================================================================
+
+df_analysis <- df %>%
+  mutate(
+    Days_90 = ifelse(Days > 90, 90, Days),
+    Death_90 = ifelse(Days > 90, 0, Death)
+  ) %>%
+  filter(
+    !is.na(PLT_RR), 
+    !is.na(Days_90), 
+    !is.na(Death_90)
+  )
+
+cat("========== 数据预处理完成 ==========\n")
+cat("最终分析样本量:", nrow(df_analysis), "\n")
+cat("90天内死亡人数:", sum(df_analysis$Death_90), "\n")
+cat("90天内删失人数:", sum(df_analysis$Death_90 == 0), "\n")
+cat("PLT_RR范围:", range(df_analysis$PLT_RR), "\n")
+cat("PLT_RR中位数:", median(df_analysis$PLT_RR), "\n\n")
+
+
+# ================================================================
+# Part 3: 自动识别所有变量（【关键修正】正确排除结局变量）
+# ================================================================
+
+# ---------- 3.1 定义需要排除的变量 ----------
+# 【关键修正】必须排除原始结局变量和新生成的结局变量
+exclude_vars <- c(
+  "Days",        # 原始生存时间
+  "Death",       # 原始死亡状态
+  "Days_90",     # 90天截断生存时间（结局变量！）
+  "Death_90"     # 90天死亡状态（结局变量！）
+  # 根据你的数据继续添加需要排除的列名，如 "ID", "PatientID" 等
+)
+
+# ---------- 3.2 自动提取所有候选变量 ----------
+# 选择所有数值型变量，并排除掉 exclude_vars
+all_vars <- df_analysis %>%
+  select(where(is.numeric)) %>%
+  select(-any_of(exclude_vars)) %>%
+  colnames()
+
+# 强制保留的变量（这些变量不经过Lasso筛选，直接进入最终模型）
+force_vars <- c("PLT_RR", "PLT", "RR", "Age")
+
+# 确保强制变量在 all_vars 中
+for (var in force_vars) {
+  if (!var %in% all_vars && var %in% colnames(df_analysis)) {
+    all_vars <- c(all_vars, var)
+  }
+}
+
+# Lasso要筛选的变量 = 全部变量 - 强制保留的变量
+lasso_vars <- setdiff(all_vars, force_vars)
+
+cat("========== 自动变量识别完成 ==========\n")
+cat("全部候选变量数:", length(all_vars), "\n")
+cat("强制保留变量数:", length(force_vars), "\n")
+cat("Lasso将筛选变量数:", length(lasso_vars), "\n")
+cat("\n强制保留变量:", paste(force_vars, collapse = ", "), "\n")
+cat("\nLasso将筛选的变量（前20个）:\n")
+print(head(lasso_vars, 20))
+if (length(lasso_vars) > 20) {
+  cat("... 还有", length(lasso_vars) - 20, "个变量\n")
+}
+cat("\n")
+
+
+# ================================================================
+# Part 4: 准备Lasso输入数据
+# ================================================================
+
+# ---------- 4.1 提取Lasso要筛选的变量 ----------
+# 只保留 lasso_vars 中存在于 df_analysis 的变量
+valid_lasso_vars <- lasso_vars[lasso_vars %in% colnames(df_analysis)]
+X_data <- df_analysis[, valid_lasso_vars]
+
+# ---------- 4.2 处理缺失值 ----------
+# 数值型变量：用中位数填充
+X_data <- X_data %>%
+  mutate(across(where(is.numeric), ~ ifelse(is.na(.), median(., na.rm = TRUE), .)))
+
+# ---------- 4.3 转换为矩阵 ----------
+X <- as.matrix(X_data)
+
+# ---------- 4.4 构建生存对象 ----------
+Y <- Surv(df_analysis$Days_90, df_analysis$Death_90)
+
+cat("========== Lasso输入数据准备完成 ==========\n")
+cat("预测变量矩阵维度:", dim(X), "\n")
+cat("生存对象事件数:", sum(Y[, 2]), "\n\n")
+
+
+# ================================================================
+# Part 5: 执行5折交叉验证Lasso-COX
+# ================================================================
+
+set.seed(123)
+
+cat("========== 开始Lasso-COX 5折交叉验证 ==========\n")
+cat("正在运行，请稍候...\n")
+
+cv_fit <- cv.glmnet(
+  x = X,
+  y = Y,
+  family = "cox",
+  alpha = 1,
+  nfolds = 5,
+  type.measure = "deviance",
+  maxit = 1000
+)
+
+cat("Lasso运行完成！\n\n")
+
+# ---------- 5.1 输出最优lambda值 ----------
+cat("========== 最优Lambda值 ==========\n")
+cat("Lambda.min (偏差最小时):", cv_fit$lambda.min, "\n")
+cat("Lambda.1se (最简模型):", cv_fit$lambda.1se, "\n\n")
+
+# ---------- 5.2 绘制交叉验证曲线 ----------
+png("01_Lasso_cross_validation.png", width = 2000, height = 1600, res = 300)
+plot(cv_fit)
+title("5-Fold Cross-Validation for Lasso-COX", line = 3)
+dev.off()
+cat("交叉验证曲线已保存: 01_Lasso_cross_validation.png\n\n")
+
+# ---------- 5.3 绘制系数路径图 ----------
+png("02_Lasso_coefficient_path.png", width = 2000, height = 1600, res = 300)
+plot(cv_fit$glmnet.fit, xvar = "lambda", label = FALSE)
+abline(v = log(cv_fit$lambda.min), col = "red", lty = 2)
+abline(v = log(cv_fit$lambda.1se), col = "blue", lty = 2)
+legend("topright", 
+       legend = c("lambda.min", "lambda.1se"), 
+       col = c("red", "blue"), 
+       lty = 2, 
+       lwd = 2)
+title("Lasso Coefficient Path")
+dev.off()
+cat("系数路径图已保存: 02_Lasso_coefficient_path.png\n\n")
+
+
+# ================================================================
+# Part 6: 提取Lasso选中的变量
+# ================================================================
+
+# ---------- 6.1 尝试多个lambda值（从严格到宽松） ----------
+cat("========== 尝试多个Lambda值 ==========\n")
+
+lambda_candidates <- c(
+  cv_fit$lambda.min,
+  cv_fit$lambda.1se,
+  cv_fit$lambda.min * 0.8,
+  cv_fit$lambda.min * 0.5,
+  cv_fit$lambda.min * 0.3
+)
+
+selected_results <- list()
+for (i in seq_along(lambda_candidates)) {
+  coef_temp <- coef(cv_fit, s = lambda_candidates[i])
+  selected_temp <- rownames(coef_temp)[which(coef_temp[, 1] != 0)]
+  selected_results[[i]] <- selected_temp
+  cat("lambda =", round(lambda_candidates[i], 5), 
+      "-> 选中变量数:", length(selected_temp), 
+      "-> 变量:", if(length(selected_temp)>0) paste(selected_temp, collapse=", ") else "无\n")
+}
+
+# ---------- 6.2 智能选择最优lambda ----------
+# 策略：从最宽松的开始，选择第一个选中变量数 > 0 的lambda
+event_count <- sum(df_analysis$Death_90)
+max_vars <- floor(event_count / 10)  # 经验法则：每10个事件允许1个变量
+
+selected_lasso <- c()
+selected_lambda <- NULL
+
+for (i in length(lambda_candidates):1) {  # 从最宽松的开始尝试
+  if (length(selected_results[[i]]) > 0) {
+    if (length(selected_results[[i]]) <= max_vars || max_vars < 1) {
+      selected_lasso <- selected_results[[i]]
+      selected_lambda <- lambda_candidates[i]
+      break
+    }
+  }
+}
+
+# 如果还是没选到，用最宽松的
+if (length(selected_lasso) == 0) {
+  cat("\n警告：所有lambda都没选中变量，使用最宽松的lambda (min*0.3)...\n")
+  coef_final <- coef(cv_fit, s = cv_fit$lambda.min * 0.3)
+  selected_lasso <- rownames(coef_final)[which(coef_final[, 1] != 0)]
+  selected_lambda <- cv_fit$lambda.min * 0.3
+}
+
+# ---------- 6.3 输出最终选中的结果 ----------
+cat("\n========== 最终Lasso筛选结果 ==========\n")
+cat("使用的lambda值:", round(selected_lambda, 5), "\n")
+cat("选中的变量数:", length(selected_lasso), "\n")
+if (length(selected_lasso) > 0) {
+  cat("选中的变量:\n")
+  print(selected_lasso)
+} else {
+  cat("警告：Lasso未选中任何变量！请检查数据。\n")
+}
+cat("\n")
+
+# ---------- 6.4 输出Lasso系数 ----------
+coef_min <- coef(cv_fit, s = selected_lambda)
+coef_df <- data.frame(
+  Variable = rownames(coef_min),
+  Coefficient = as.numeric(coef_min[, 1])
+) %>% filter(Coefficient != 0)
+
+cat("========== Lasso系数 (选中的lambda) ==========\n")
+print(coef_df)
+cat("\n")
+
+# 保存Lasso系数
+write.csv(coef_df, "03_Lasso_coefficients.csv", row.names = FALSE)
+cat("Lasso系数已保存: 03_Lasso_coefficients.csv\n\n")
+
+
+# ================================================================
+# Part 7: 构建最终多因素COX模型
+# ================================================================
+
+# ---------- 7.1 合并变量：Lasso选中 + 强制保留 ----------
+final_vars <- unique(c(selected_lasso, force_vars))
+
+# 只保留数据中实际存在的变量
+final_vars <- final_vars[final_vars %in% colnames(df_analysis)]
+
+# 【安全检查】确保结局变量没有被误纳入
+final_vars <- setdiff(final_vars, c("Days", "Death", "Days_90", "Death_90"))
+
+cat("========== 最终COX模型 ==========\n")
+cat("最终纳入变量数:", length(final_vars), "\n")
+cat("最终变量列表:\n")
+print(final_vars)
+cat("\n")
+
+# ---------- 7.2 准备最终数据 ----------
+df_final <- df_analysis[, final_vars]
+
+# 处理缺失值
+df_final <- df_final %>%
+  mutate(across(where(is.numeric), ~ ifelse(is.na(.), median(., na.rm = TRUE), .)))
+
+# 添加生存时间和事件（不参与建模，只在公式左侧）
+df_final$Days_90 <- df_analysis$Days_90
+df_final$Death_90 <- df_analysis$Death_90
+
+# ---------- 7.3 拟合多因素COX ----------
+formula_str <- paste("Surv(Days_90, Death_90) ~", paste(final_vars, collapse = " + "))
+cat("模型公式:\n", formula_str, "\n\n")
+
+final_cox <- coxph(as.formula(formula_str), data = df_final)
+
+cat("========== 多因素COX回归结果 ==========\n")
+print(summary(final_cox))
+cat("\n")
+
+# ---------- 7.4 提取HR汇总表 ----------
+hr_table <- data.frame(
+  Variable = final_vars,
+  HR = round(exp(coef(final_cox)), 3),
+  HR_lower = round(exp(confint(final_cox))[, 1], 3),
+  HR_upper = round(exp(confint(final_cox))[, 2], 3),
+  P_value = round(summary(final_cox)$coefficients[, "Pr(>|z|)"], 4)
+)
+
+# 添加显著性标记
+hr_table$Significance <- ifelse(hr_table$P_value < 0.001, "***",
+                          ifelse(hr_table$P_value < 0.01, "**",
+                          ifelse(hr_table$P_value < 0.05, "*", "")))
+
+cat("========== HR汇总表 ==========\n")
+print(hr_table)
+cat("\n")
+
+# 保存HR表
+write.csv(hr_table, "04_Final_COX_HR_table.csv", row.names = FALSE)
+cat("HR汇总表已保存: 04_Final_COX_HR_table.csv\n\n")
+
+# ---------- 7.5 VIF检验（检查共线性） ----------
+if (length(final_vars) >= 2) {
+  cat("========== VIF共线性检验 ==========\n")
+  tryCatch({
+    vif_values <- vif(final_cox)
+    print(vif_values)
+    cat("\nVIF > 5 表示存在中度共线性，VIF > 10 表示严重共线性\n")
+  }, error = function(e) {
+    cat("VIF检验失败（可能由于分类变量或模型复杂度）\n")
+  })
+  cat("\n")
+}
+
+
+# ================================================================
+# Part 8: PLT_RR三分位生存曲线（未调整）
+# ================================================================
+
+# ---------- 8.1 三分位分组 ----------
+tertiles <- quantile(df_analysis$PLT_RR, probs = c(0, 1/3, 2/3, 1), na.rm = TRUE)
+
+df_analysis$PLT_group <- cut(
+  df_analysis$PLT_RR, 
+  breaks = tertiles, 
+  include.lowest = TRUE,
+  labels = c("Low (T1)", "Medium (T2)", "High (T3)")
+)
+
+df_analysis$PLT_group <- relevel(df_analysis$PLT_group, ref = "Low (T1)")
+
+cat("========== PLT_RR三分位分组 ==========\n")
+cat("三分位界值:\n")
+print(tertiles)
+cat("\n各组样本量:\n")
+print(table(df_analysis$PLT_group))
+cat("\n")
+
+# ---------- 8.2 三分位COX（未调整，用于HR标注） ----------
+cox_tertile <- coxph(Surv(Days_90, Death_90) ~ PLT_group, data = df_analysis)
+hr_tert <- exp(coef(cox_tertile))
+ci_tert <- exp(confint(cox_tertile))
+p_tert <- summary(cox_tertile)$coefficients[, "Pr(>|z|)"]
+
+hr_annotation <- sprintf(
+  "PLT_RR (Tertile Split)\nMedium vs Low: HR = %.2f (95%% CI: %.2f-%.2f), p = %.3f\nHigh vs Low: HR = %.2f (95%% CI: %.2f-%.2f), p = %.3f",
+  hr_tert[1], ci_tert[1, 1], ci_tert[1, 2], p_tert[1],
+  hr_tert[2], ci_tert[2, 1], ci_tert[2, 2], p_tert[2]
+)
+
+# ---------- 8.3 绘制KM曲线（未调整） ----------
+fit_km <- survfit(Surv(Days_90, Death_90) ~ PLT_group, data = df_analysis)
+logrank_p <- surv_pvalue(fit_km)$pval
+
+p_km <- ggsurvplot(
+  fit_km,
+  data = df_analysis,
+  pval = TRUE,
+  pval.method = TRUE,
+  conf.int = TRUE,
+  conf.int.style = "step",
+  risk.table = TRUE,
+  risk.table.col = "strata",
+  risk.table.height = 0.30,
+  surv.median.line = "hv",
+  legend.labs = c("Low (T1)", "Medium (T2)", "High (T3)"),
+  legend.title = "PLT_RR Group",
+  xlab = "Survival Time (Days)",
+  ylab = "Survival Probability",
+  title = "Kaplan-Meier Survival Curve by PLT_RR (Tertile Split)",
+  subtitle = paste0("Log-rank p = ", round(logrank_p, 4)),
+  palette = c("#2E9FDF", "#F39C12", "#E74C3C"),
+  xlim = c(0, 90),
+  break.time.by = 10,
+  ggtheme = theme_bw() +
+    theme(
+      legend.position = c(0.82, 0.82),
+      legend.background = element_rect(fill = "white", color = "black", size = 0.3),
+      legend.title = element_text(size = 10),
+      legend.text = element_text(size = 9),
+      plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+      plot.subtitle = element_text(hjust = 0.5, size = 10),
+      axis.title = element_text(size = 12),
+      axis.text = element_text(size = 10)
+    )
+)
+
+p_km$plot <- p_km$plot + 
+  annotate(
+    "text",
+    x = 2,
+    y = 0.08,
+    label = hr_annotation,
+    hjust = 0,
+    vjust = 0,
+    size = 3.2,
+    fontface = "plain",
+    color = "black"
+  )
+
+print(p_km)
+
+png("05_KM_curve_PLT_RR_unadjusted.png", width = 3000, height = 3600, res = 400)
+print(p_km)
+dev.off()
+cat("未调整生存曲线已保存: 05_KM_curve_PLT_RR_unadjusted.png\n\n")
+
+
+# ================================================================
+# Part 9: 调整后的生存曲线（Adjusted Survival Curve）- 修正版
+# ================================================================
+
+# ---------- 9.1 检查是否需要绘制 ----------
+if (length(final_vars) > 0 && "PLT_RR" %in% final_vars) {
+  
+  cat("\n========== 开始绘制调整后的生存曲线 ==========\n")
+  
+  # ---------- 9.2 【修正】准备预测数据 ----------
+  # 首先，确保final_vars中所有变量都在df_analysis中存在
+  valid_final_vars <- final_vars[final_vars %in% colnames(df_analysis)]
+  if (length(valid_final_vars) < length(final_vars)) {
+    cat("注意：以下变量在数据中不存在，已自动移除:\n")
+    print(setdiff(final_vars, valid_final_vars))
+    final_vars <- valid_final_vars
+  }
+  
+  # 计算三分位中位数
+  tertile_medians <- df_analysis %>%
+    group_by(PLT_group) %>%
+    summarise(PLT_RR = median(PLT_RR, na.rm = TRUE)) %>%
+    pull(PLT_RR)
+  
+  # 初始化newdata
+  newdata_adj <- data.frame(
+    PLT_RR = tertile_medians
+  )
+  
+  # 为其他协变量赋值
+  cat("\n正在为协变量赋值（中位数/众数）:\n")
+  for (var in final_vars) {
+    if (var != "PLT_RR" && var %in% colnames(df_analysis)) {
+      if (is.numeric(df_analysis[[var]])) {
+        # 连续变量：用中位数
+        median_val <- median(df_analysis[[var]], na.rm = TRUE)
+        newdata_adj[[var]] <- median_val
+        cat("  ", var, "-> 中位数:", median_val, "\n")
+      } else if (is.factor(df_analysis[[var]]) || is.character(df_analysis[[var]])) {
+        # 分类变量：用众数
+        mode_val <- names(sort(table(df_analysis[[var]]), decreasing = TRUE))[1]
+        newdata_adj[[var]] <- mode_val
+        cat("  ", var, "-> 众数:", mode_val, "\n")
+      }
+    }
+  }
+  
+  # 添加分组标签
+  newdata_adj$PLT_group <- c("Low (T1)", "Medium (T2)", "High (T3)")
+  
+  cat("\n========== 调整后生存曲线的预测数据 ==========\n")
+  print(newdata_adj)
+  cat("\n")
+  
+  # 确保模型公式中的变量都在newdata中
+  # 重新构建final_cox（使用有效的变量）
+  formula_str <- paste("Surv(Days_90, Death_90) ~", paste(final_vars, collapse = " + "))
+  cat("重新拟合的模型公式:\n", formula_str, "\n\n")
+  
+  # 准备最终数据
+  df_final <- df_analysis[, final_vars]
+  df_final <- df_final %>%
+    mutate(across(where(is.numeric), ~ ifelse(is.na(.), median(., na.rm = TRUE), .)))
+  df_final$Days_90 <- df_analysis$Days_90
+  df_final$Death_90 <- df_analysis$Death_90
+  
+  # 重新拟合COX模型
+  final_cox <- coxph(as.formula(formula_str), data = df_final)
+  
+  # ---------- 9.3 计算调整后的生存曲线 ----------
+  tryCatch({
+    fit_adj <- survfit(final_cox, newdata = newdata_adj)
+  }, error = function(e) {
+    cat("错误：survfit失败 -", e$message, "\n")
+    cat("请检查newdata是否包含所有模型变量\n")
+    cat("newdata中的变量名:", paste(colnames(newdata_adj), collapse=", "), "\n")
+    cat("模型中的变量名:", paste(final_vars, collapse=", "), "\n")
+    stop("请修正后重新运行")
+  })
+  
+  # ---------- 9.4 提取调整后的HR ----------
+  # 使用PLT_group重新拟合（确保PLT_group存在且为因子）
+  df_analysis$PLT_group <- factor(df_analysis$PLT_group, 
+                                   levels = c("Low (T1)", "Medium (T2)", "High (T3)"))
+  
+  adj_vars <- setdiff(final_vars, "PLT_RR")
+  
+  # 确保adj_vars都在数据中
+  adj_vars <- adj_vars[adj_vars %in% colnames(df_analysis)]
+  
+  if (length(adj_vars) > 0) {
+    adj_formula <- paste("Surv(Days_90, Death_90) ~ PLT_group +", paste(adj_vars, collapse = " + "))
+  } else {
+    adj_formula <- "Surv(Days_90, Death_90) ~ PLT_group"
+  }
+  
+  cat("调整后的三分位COX模型公式:\n")
+  cat(adj_formula, "\n\n")
+  
+  # 准备数据
+  df_adj_cox <- df_analysis %>%
+    select(all_of(c("Days_90", "Death_90", "PLT_group", adj_vars))) %>%
+    mutate(across(where(is.numeric), ~ ifelse(is.na(.), median(., na.rm = TRUE), .)))
+  
+  cox_adj_tertile <- coxph(as.formula(adj_formula), data = df_adj_cox)
+  
+  # 提取调整后的HR
+  hr_adj <- exp(coef(cox_adj_tertile))
+  ci_adj <- exp(confint(cox_adj_tertile))
+  p_adj <- summary(cox_adj_tertile)$coefficients[, "Pr(>|z|)"]
+  
+  # 只提取PLT_group的HR
+  hr_adj_tert <- hr_adj[grepl("PLT_group", names(hr_adj))]
+  
+  if (length(hr_adj_tert) >= 2) {
+    ci_adj_tert <- ci_adj[grepl("PLT_group", rownames(ci_adj)), ]
+    p_adj_tert <- p_adj[grepl("PLT_group", names(p_adj))]
+    
+    hr_adj_annotation <- sprintf(
+      "Adjusted HR (Multivariate COX)\nMedium vs Low: HR = %.2f (95%% CI: %.2f-%.2f), p = %.3f\nHigh vs Low: HR = %.2f (95%% CI: %.2f-%.2f), p = %.3f",
+      hr_adj_tert[1], ci_adj_tert[1, 1], ci_adj_tert[1, 2], p_adj_tert[1],
+      hr_adj_tert[2], ci_adj_tert[2, 1], ci_adj_tert[2, 2], p_adj_tert[2]
+    )
+  } else {
+    hr_adj_annotation <- "Adjusted HR not available"
+  }
+  
+  # ---------- 9.5 绘制调整后的生存曲线 ----------
+  p_adj <- ggsurvplot(
+    fit_adj,
+    data = newdata_adj,
+    conf.int = TRUE,
+    conf.int.style = "step",
+    legend.labs = c("Low (T1)", "Medium (T2)", "High (T3)"),
+    legend.title = "PLT_RR Group",
+    xlab = "Survival Time (Days)",
+    ylab = "Survival Probability",
+    title = "Adjusted Survival Curve by PLT_RR (Tertile Split)",
+    subtitle = paste0(
+      "Adjusted for: ", 
+      paste(setdiff(final_vars, "PLT_RR"), collapse = ", ")
+    ),
+    palette = c("#2E9FDF", "#F39C12", "#E74C3C"),
+    xlim = c(0, 90),
+    break.time.by = 10,
+    ggtheme = theme_bw() +
+      theme(
+        legend.position = c(0.82, 0.82),
+        legend.background = element_rect(fill = "white", color = "black", size = 0.3),
+        legend.title = element_text(size = 10),
+        legend.text = element_text(size = 9),
+        plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+        plot.subtitle = element_text(hjust = 0.5, size = 9),
+        axis.title = element_text(size = 12),
+        axis.text = element_text(size = 10)
+      )
+  )
+  
+  # 添加调整后的HR标注（如果有）
+  if (hr_adj_annotation != "Adjusted HR not available") {
+    p_adj$plot <- p_adj$plot + 
+      annotate(
+        "text",
+        x = 2,
+        y = 0.08,
+        label = hr_adj_annotation,
+        hjust = 0,
+        vjust = 0,
+        size = 3.0,
+        fontface = "plain",
+        color = "black"
+      )
+  }
+  
+  print(p_adj)
+  
+  png("06_Adjusted_KM_curve_PLT_RR.png", width = 3000, height = 3600, res = 400)
+  print(p_adj)
+  dev.off()
+  cat("调整后的生存曲线已保存: 06_Adjusted_KM_curve_PLT_RR.png\n\n")
+  
+  # ---------- 9.6 输出调整后的HR表 ----------
+  if (exists("hr_adj_tert") && length(hr_adj_tert) >= 2) {
+    cat("========== 调整后三分位COX的HR汇总 ==========\n")
+    adj_hr_table <- data.frame(
+      Comparison = c("Medium (T2) vs Low (T1)", "High (T3) vs Low (T1)"),
+      HR = round(hr_adj_tert, 3),
+      HR_lower = round(ci_adj_tert[, 1], 3),
+      HR_upper = round(ci_adj_tert[, 2], 3),
+      P_value = round(p_adj_tert, 4)
+    )
+    print(adj_hr_table)
+    cat("\n")
+    
+    write.csv(adj_hr_table, "07_Adjusted_tertile_HR_table.csv", row.names = FALSE)
+    cat("调整后三分位HR表已保存: 07_Adjusted_tertile_HR_table.csv\n\n")
+  }
+  
+} else {
+  cat("\n跳过调整后生存曲线：PLT_RR不在最终模型中\n")
+}
+
+
+# ================================================================
+# Part 10: 最终汇总
+# ================================================================
+
+cat("============================================================\n")
+cat("========== 全部分析完成！ ==========\n")
+cat("============================================================\n")
+cat("\n生成的文件列表:\n")
+cat("  1. 01_Lasso_cross_validation.png - Lasso交叉验证曲线\n")
+cat("  2. 02_Lasso_coefficient_path.png - Lasso系数路径图\n")
+cat("  3. 03_Lasso_coefficients.csv - Lasso系数\n")
+cat("  4. 04_Final_COX_HR_table.csv - 多因素COX的HR汇总表\n")
+cat("  5. 05_KM_curve_PLT_RR_unadjusted.png - 未调整的KM生存曲线\n")
+cat("  6. 06_Adjusted_KM_curve_PLT_RR.png - 调整后的生存曲线\n")
+cat("  7. 07_Adjusted_tertile_HR_table.csv - 调整后三分位HR表\n")
+
+cat("\n========== 主要发现 ==========\n")
+if ("PLT_RR" %in% final_vars) {
+  plt_rr_hr <- hr_table[hr_table$Variable == "PLT_RR", ]
+  cat(sprintf(
+    "PLT_RR (连续变量): HR = %.3f (95%% CI: %.3f-%.3f), p = %.4f\n",
+    plt_rr_hr$HR, plt_rr_hr$HR_lower, plt_rr_hr$HR_upper, plt_rr_hr$P_value
+  ))
+}
+
+if (exists("adj_hr_table")) {
+  cat("\nPLT_RR三分位（调整后）:\n")
+  print(adj_hr_table)
+}
+
+cat("\n============================================================\n")

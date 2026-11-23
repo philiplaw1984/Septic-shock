@@ -1,0 +1,87 @@
+# 加载必要的包
+library(readxl)
+library(tidyverse)
+library(tableone)
+library(ggplot2)
+library(ggpubr)
+library(patchwork)
+
+# 读取数据
+data <- read_excel("DD.xlsx", sheet = 1)
+
+# 查看数据结构 - 确认列名
+str(data)
+head(data)
+
+# 查看所有列名
+colnames(data)
+
+# 最后一列是Death，重命名
+colnames(data)[ncol(data)] <- "Death"
+
+# 将 Death 转换为因子
+data$Death <- factor(data$Death, levels = c(0, 1), labels = c("Alive", "Dead"))
+
+# 查看死亡组和存活组的分布
+table(data$Death)
+
+# ============================================================
+# 方法1：使用 tableone 包生成基线表格
+# ============================================================
+
+# 首先获取所有列名，确认实际名称
+all_cols <- colnames(data)
+print(all_cols)
+
+# 定义变量列表（使用实际列名，如果有空格需要用反引号）
+# 注意：根据您之前的数据，第一列是"Infection site"（有空格）
+vars <- c(
+  "Infection site",  # 如果有空格，需要用反引号或双引号
+  "Sex", "Age", "ABO", "Rh", "hypertension", "CHD", "DM", 
+  "Smoking", "Alcohol", "HR", "P", "RR", "T", "DBP", "SBP",
+  "WBC", "RBC", "Lymphocyte", "Monocyte", "Neutrophil", 
+  "Hemoglobin", "PLT", "RDW", "Albumin", "MPV", "ALT", "AST",
+  "TBIL", "Scr", "BUN", "K", "Cl", "Na", "LDH", "Glucose",
+  "INR", "PT", "PTA", "TT", "APTT", "Fbg", "FDP", "Ddimer",
+  "CRP", "SaO2", "SB", "PaO2", "PaCO2", "pH", "ctHb", 
+  "lactate", "FiO2", "OI", "Culture result",  # Culture result也有空格
+  "PLT_RR", "PLT_LYM", "PLT_RDW", "PLT_MPV", "SII", "PLT_ALB"
+)
+
+# 分类变量列表
+catVars <- c(
+  "Infection site", "Sex", "ABO", "Rh", "hypertension", 
+  "CHD", "DM", "Smoking", "Alcohol", "Culture result"
+)
+
+# 检查哪些变量实际存在于数据中
+vars_exist <- vars[vars %in% colnames(data)]
+catVars_exist <- catVars[catVars %in% colnames(data)]
+
+cat("存在的数值变量数量:", length(vars_exist), "\n")
+cat("存在的分类变量数量:", length(catVars_exist), "\n")
+
+# 如果某些变量不存在，显示警告
+if (length(vars_exist) < length(vars)) {
+  missing_vars <- setdiff(vars, vars_exist)
+  cat("以下变量不存在:", paste(missing_vars, collapse=", "), "\n")
+}
+
+# 创建tableone
+if (length(vars_exist) > 0) {
+  tab1 <- CreateTableOne(
+    vars = vars_exist, 
+    strata = "Death", 
+    data = data,
+    factorVars = catVars_exist,
+    includeNA = TRUE
+  )
+  
+  # 打印表格
+  print(tab1, showAllLevels = TRUE)
+  
+  # 导出为CSV
+  tab1_matrix <- print(tab1, showAllLevels = TRUE)
+  write.csv(tab1_matrix, "death_comparison_table.csv")
+  cat("基线特征表已保存为 death_comparison_table.csv\n")
+}

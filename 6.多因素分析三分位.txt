@@ -1,0 +1,417 @@
+# ============================================================
+# 多因素Logistic回归分析 - PLT_RR三分位数与Death
+# ============================================================
+
+# 加载必要的包
+library(readxl)
+library(tidyverse)
+library(broom)
+library(car)
+library(pROC)
+library(ggplot2)
+library(forestplot)
+library(rpart)
+library(partykit)
+
+# 读取数据
+data <- read_excel("DD.xlsx", sheet = 1)
+colnames(data)[ncol(data)] <- "Death"
+
+# ============================================================
+# 1. 数据预处理
+# ============================================================
+
+data$Death_binary <- data$Death
+
+# 将分类变量转换为因子
+categorical_vars <- c("Infection site", "Sex", "ABO", "Rh", "hypertension", 
+                      "CHD", "DM", "Smoking", "Alcohol", "Culture result")
+
+for (var in categorical_vars) {
+  if (var %in% colnames(data)) {
+    data[[var]] <- as.factor(data[[var]])
+  }
+}
+
+# ============================================================
+# 2. 创建PLT_RR三分位数
+# ============================================================
+
+# 计算PLT_RR的分位数
+quantiles_plt_rr <- quantile(data$PLT_RR, probs = c(0, 1/3, 2/3, 1), na.rm = TRUE)
+cat("PLT_RR三分位数切点:\n")
+print(quantiles_plt_rr)
+
+# 创建三分位数变量
+data$PLT_RR_tertile <- cut(data$PLT_RR, 
+                           breaks = quantiles_plt_rr, 
+                           include.lowest = TRUE,
+                           labels = c("T1 (Low)", "T2 (Medium)", "T3 (High)"))
+
+# 检查各组的分布
+cat("\n三分位数分组分布:\n")
+print(table(data$PLT_RR_tertile, useNA = "ifany"))
+
+# 检查各组的死亡情况
+cat("\n各组死亡情况:\n")
+print(table(data$PLT_RR_tertile, data$Death_binary))
+
+# 计算各组的死亡率和样本量
+group_stats <- data %>%
+  group_by(PLT_RR_tertile) %>%
+  summarise(
+    N = n(),
+    Deaths = sum(Death_binary, na.rm = TRUE),
+    Death_Rate = Deaths / N * 100,
+    Median_PLT_RR = median(PLT_RR, na.rm = TRUE),
+    IQR_PLT_RR = IQR(PLT_RR, na.rm = TRUE)
+  )
+
+cat("\n各组统计信息:\n")
+print(group_stats)
+
+# ============================================================
+# 3. 删除缺失值（用于多因素分析）
+# ============================================================
+
+vars_for_model <- c("PLT_RR_tertile", "Death_binary", "Age", "Sex", 
+                    "hypertension", "CHD", "DM", "Smoking",
+                    "BUN", "Scr", "Albumin", "Hemoglobin")
+
+data_complete <- data[complete.cases(data[, vars_for_model]), ]
+
+cat("\n原始样本量:", nrow(data), "\n")
+cat("完整样本量:", nrow(data_complete), "\n")
+cat("死亡人数:", sum(data_complete$Death_binary == 1), "\n")
+cat("存活人数:", sum(data_complete$Death_binary == 0), "\n")
+
+# ============================================================
+# 4. 构建3个多因素Logistic回归模型（以T1为参照）
+# ============================================================
+
+# 设置T1为参照组
+data_complete$PLT_RR_tertile <- relevel(data_complete$PLT_RR_tertile, ref = "T1 (Low)")
+
+# -------- Model 1: 未调整（仅PLT_RR三分位数） --------
+model1 <- glm(Death_binary ~ PLT_RR_tertile, 
+              data = data_complete, 
+              family = binomial(link = "logit"))
+
+# -------- Model 2: 调整人口学特征 + 合并症 --------
+model2 <- glm(Death_binary ~ PLT_RR_tertile + Age + Sex + hypertension + CHD + DM + Smoking, 
+              data = data_complete, 
+              family = binomial(link = "logit"))
+
+# -------- Model 3: 调整人口学 + 合并症 + 重要实验室指标 --------
+model3 <- glm(Death_binary ~ PLT_RR_tertile + Age + Sex + hypertension + CHD + DM + Smoking +
+                BUN + Scr + Albumin + Hemoglobin,
+              data = data_complete, 
+              family = binomial(link = "logit"))
+
+# 将所有模型放入列表
+models <- list(
+  "Model 1 (Unadjusted)" = model1,
+  "Model 2 (+ Demographics & Comorbidities)" = model2,
+  "Model 3 (+ Important Labs)" = model3
+)
+
+# ============================================================
+# 5. 提取PLT_RR三分位数在各模型中的结果
+# ============================================================
+
+extract_tertile_results <- function(model, model_name) {
+  summary_model <- summary(model)
+  coef_df <- as.data.frame(summary_model$coefficients)
+  
+  # 提取PLT_RR_tertile相关的行（排除截距）
+  tertile_rows <- grepl("PLT_RR_tertile", rownames(coef_df))
+  
+  if (sum(tertile_rows) > 0) {
+    results <- data.frame(
+      Model = model_name,
+      Tertile = gsub("PLT_RR_tertile", "", rownames(coef_df)[tertile_rows]),
+      OR = exp(coef_df[tertile_rows, "Estimate"]),
+      OR_lower = exp(coef_df[tertile_rows, "Estimate"] - 1.96 * coef_df[tertile_rows, "Std. Error"]),
+      OR_upper = exp(coef_df[tertile_rows, "Estimate"] + 1.96 * coef_df[tertile_rows, "Std. Error"]),
+      P_value = coef_df[tertile_rows, "Pr(>|z|)"],
+      AIC = AIC(model)
+    )
+    return(results)
+  } else {
+    return(NULL)
+  }
+}
+
+# 提取所有模型的结果
+plt_rr_tertile_results <- do.call(rbind, lapply(names(models), function(name) {
+  extract_tertile_results(models[[name]], name)
+}))
+
+# 添加T1作为参照组
+t1_ref <- data.frame(
+  Model = unique(plt_rr_tertile_results$Model),
+  Tertile = "T1 (Low)",
+  OR = 1,
+  OR_lower = 1,
+  OR_upper = 1,
+  P_value = NA,
+  AIC = NA
+)
+
+plt_rr_tertile_results <- rbind(plt_rr_tertile_results, t1_ref)
+plt_rr_tertile_results <- plt_rr_tertile_results[order(plt_rr_tertile_results$Model, 
+                                                        plt_rr_tertile_results$Tertile), ]
+
+# 格式化结果
+plt_rr_tertile_results$OR_CI <- sprintf("%.3f (%.3f - %.3f)", 
+                                         plt_rr_tertile_results$OR, 
+                                         plt_rr_tertile_results$OR_lower, 
+                                         plt_rr_tertile_results$OR_upper)
+plt_rr_tertile_results$P_display <- ifelse(is.na(plt_rr_tertile_results$P_value), "Ref",
+                                            ifelse(plt_rr_tertile_results$P_value < 0.001, "<0.001", 
+                                                   round(plt_rr_tertile_results$P_value, 4)))
+
+cat("\n====== PLT_RR三分位数在各模型中的结果 ======\n")
+print(plt_rr_tertile_results[, c("Model", "Tertile", "OR_CI", "P_display")])
+
+# ============================================================
+# 6. P for trend（趋势检验）
+# ============================================================
+
+# 将三分位数转换为数值型（1, 2, 3）进行趋势检验
+data_complete$PLT_RR_tertile_num <- as.numeric(data_complete$PLT_RR_tertile)
+
+# 在各模型中测试线性趋势
+trend_test <- function(model_base, data, outcome) {
+  # 将三分位数作为连续变量纳入模型
+  model_trend <- glm(as.formula(paste(outcome, "~ PLT_RR_tertile_num +", 
+                                       paste(setdiff(names(coef(model_base))[-1], 
+                                                     grep("PLT_RR_tertile", names(coef(model_base)), value = TRUE)), 
+                                             collapse = " +"))),
+                      data = data, family = binomial)
+  coef_sum <- summary(model_trend)$coefficients
+  idx <- which(rownames(coef_sum) == "PLT_RR_tertile_num")
+  if (length(idx) > 0) {
+    return(coef_sum[idx, "Pr(>|z|)"])
+  } else {
+    return(NA)
+  }
+}
+
+trend_p <- data.frame(
+  Model = names(models),
+  P_for_trend = c(
+    trend_test(model1, data_complete, "Death_binary"),
+    trend_test(model2, data_complete, "Death_binary"),
+    trend_test(model3, data_complete, "Death_binary")
+  )
+)
+
+cat("\n====== P for Trend ======\n")
+print(trend_p)
+
+# ============================================================
+# 7. 完整模型（Model 3）的所有变量结果
+# ============================================================
+
+extract_all_vars <- function(model, model_name) {
+  summary_model <- summary(model)
+  coef_df <- as.data.frame(summary_model$coefficients)
+  
+  results <- data.frame(
+    Variable = rownames(coef_df),
+    Beta = coef_df[, "Estimate"],
+    SE = coef_df[, "Std. Error"],
+    Wald_Z = coef_df[, "z value"],
+    P_value = coef_df[, "Pr(>|z|)"],
+    OR = exp(coef_df[, "Estimate"]),
+    OR_lower = exp(coef_df[, "Estimate"] - 1.96 * coef_df[, "Std. Error"]),
+    OR_upper = exp(coef_df[, "Estimate"] + 1.96 * coef_df[, "Std. Error"])
+  )
+  
+  results <- results[results$Variable != "(Intercept)", ]
+  results$Significant <- ifelse(results$P_value < 0.001, "***",
+                                ifelse(results$P_value < 0.01, "**",
+                                       ifelse(results$P_value < 0.05, "*", "")))
+  results$Model <- model_name
+  
+  return(results)
+}
+
+model3_full <- extract_all_vars(model3, "Model 3")
+
+cat("\n====== Model 3 完整结果 ======\n")
+print(model3_full[, c("Variable", "OR", "OR_lower", "OR_upper", "P_value", "Significant")])
+
+# ============================================================
+# 8. 模型比较
+# ============================================================
+
+model_comparison <- data.frame(
+  Model = names(models),
+  AIC = sapply(models, AIC),
+  BIC = sapply(models, BIC),
+  LogLik = sapply(models, logLik),
+  DF = sapply(models, df.residual)
+)
+
+# 计算Pseudo R-squared (McFadden)
+null_model <- glm(Death_binary ~ 1, data = data_complete, family = binomial)
+for (i in 1:length(models)) {
+  model_comparison[i, "R2_McFadden"] <- 1 - logLik(models[[i]])/logLik(null_model)
+}
+
+cat("\n====== 模型比较 ======\n")
+print(model_comparison)
+
+# ============================================================
+# 9. 模型诊断
+# ============================================================
+
+cat("\n====== 共线性诊断 (VIF) ======\n")
+vif_values <- vif(model3)
+print(vif_values)
+
+# ROC曲线
+pred_probs <- predict(model3, type = "response")
+roc_curve <- roc(data_complete$Death_binary, pred_probs)
+cat(sprintf("\nModel 3 AUC: %.3f (95%% CI: %.3f - %.3f)\n", 
+            auc(roc_curve),
+            ci.auc(roc_curve)[1],
+            ci.auc(roc_curve)[3]))
+
+# ============================================================
+# 10. 可视化
+# ============================================================
+
+# 10.1 PLT_RR三分位数跨模型的森林图
+forest_data <- plt_rr_tertile_results %>%
+  filter(!is.na(OR)) %>%
+  mutate(
+    Model_Short = gsub("\\s*\\(.*\\)", "", Model),
+    Label = paste(Model_Short, Tertile, sep = ": ")
+  )
+
+forest_plot <- ggplot(forest_data, aes(x = OR, y = reorder(Label, as.numeric(factor(Tertile))))) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "gray50", size = 1) +
+  geom_errorbarh(aes(xmin = OR_lower, xmax = OR_upper), 
+                 height = 0.2, color = "steelblue", size = 1) +
+  geom_point(aes(color = P_value < 0.05), size = 3.5) +
+  scale_color_manual(values = c("TRUE" = "#E74C3C", "FALSE" = "#2C3E50"),
+                     labels = c("TRUE" = "P < 0.05", "FALSE" = "P ≥ 0.05"),
+                     na.value = "gray50") +
+  scale_x_log10(breaks = c(0.5, 0.8, 1, 1.5, 2, 3, 5)) +
+  labs(title = "PLT_RR Tertiles and Risk of Death",
+       subtitle = "T1 (Low) as Reference",
+       x = "Odds Ratio (95% CI)",
+       y = "",
+       color = "Significance") +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.y = element_text(size = 10),
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5, size = 12),
+    legend.position = "top"
+  )
+
+ggsave("PLT_RR_tertile_multivariable_models.png", forest_plot, width = 10, height = 6, dpi = 300)
+
+# 10.2 显示各组死亡率的条形图
+bar_plot <- ggplot(group_stats, aes(x = PLT_RR_tertile, y = Death_Rate)) +
+  geom_bar(stat = "identity", fill = c("#2E86C1", "#F39C12", "#E74C3C"), alpha = 0.8) +
+  geom_text(aes(label = paste0(round(Death_Rate, 1), "%\n(", Deaths, "/", N, ")")), 
+            vjust = -0.5, size = 3.5) +
+  labs(title = "Mortality Rate by PLT_RR Tertile",
+       x = "PLT_RR Tertile",
+       y = "Mortality Rate (%)") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(hjust = 0.5, size = 14, face = "bold"))
+
+ggsave("PLT_RR_tertile_mortality.png", bar_plot, width = 6, height = 5, dpi = 300)
+
+# 10.3 Model 3 ROC曲线
+png("model3_tertile_roc_curve.png", width = 800, height = 700)
+plot(roc_curve, main = paste("Model 3 ROC Curve (AUC =", round(auc(roc_curve), 3), ")"))
+dev.off()
+
+# ============================================================
+# 11. 保存结果
+# ============================================================
+
+write.csv(plt_rr_tertile_results, "PLT_RR_tertile_multivariable_results.csv", row.names = FALSE)
+write.csv(trend_p, "PLT_RR_tertile_trend_test.csv", row.names = FALSE)
+write.csv(model3_full, "model3_tertile_full_results.csv", row.names = FALSE)
+write.csv(model_comparison, "model_comparison_tertile.csv", row.names = FALSE)
+write.csv(group_stats, "PLT_RR_tertile_group_stats.csv", row.names = FALSE)
+
+cat("\n生成的文件:\n")
+cat("1. PLT_RR_tertile_multivariable_results.csv - 三分位数跨模型结果\n")
+cat("2. PLT_RR_tertile_trend_test.csv - 趋势检验P值\n")
+cat("3. model3_tertile_full_results.csv - Model 3完整结果\n")
+cat("4. model_comparison_tertile.csv - 模型比较\n")
+cat("5. PLT_RR_tertile_group_stats.csv - 各组统计信息\n")
+cat("6. PLT_RR_tertile_multivariable_models.png - 森林图\n")
+cat("7. PLT_RR_tertile_mortality.png - 死亡率条形图\n")
+cat("8. model3_tertile_roc_curve.png - ROC曲线\n")
+
+# ============================================================
+# 12. 最终报告
+# ============================================================
+
+cat("\n========================================\n")
+cat("PLT_RR三分位数与死亡风险多因素分析报告\n")
+cat("========================================\n\n")
+
+cat("【研究设计】\n")
+cat("  研究变量: PLT_RR三分位数 (T1低, T2中, T3高)\n")
+cat("  结局事件: Death (住院期间死亡)\n")
+cat("  样本量:", nrow(data_complete), "\n")
+cat("  死亡人数:", sum(data_complete$Death_binary == 1), 
+    "(", round(sum(data_complete$Death_binary == 1)/nrow(data_complete)*100, 1), "%)\n\n")
+
+cat("【PLT_RR三分位数切点】\n")
+cat(sprintf("  T1 (Low): ≤ %.2f\n", quantiles_plt_rr[2]))
+cat(sprintf("  T2 (Medium): %.2f - %.2f\n", quantiles_plt_rr[2], quantiles_plt_rr[3]))
+cat(sprintf("  T3 (High): > %.2f\n\n", quantiles_plt_rr[3]))
+
+cat("【各组死亡率和样本量】\n")
+for (i in 1:nrow(group_stats)) {
+  cat(sprintf("  %s: N=%d, 死亡=%d (%.1f%%), 中位数PLT_RR=%.2f\n",
+              group_stats[i, "PLT_RR_tertile"],
+              group_stats[i, "N"],
+              group_stats[i, "Deaths"],
+              group_stats[i, "Death_Rate"],
+              group_stats[i, "Median_PLT_RR"]))
+}
+
+cat("\n【PLT_RR三分位数在多因素模型中的结果 (参照组: T1 Low)】\n")
+for (i in 1:nrow(plt_rr_tertile_results)) {
+  if (!is.na(plt_rr_tertile_results[i, "OR"])) {
+    cat(sprintf("  %s %s: OR = %.3f (95%% CI: %.3f - %.3f), P = %s\n",
+                plt_rr_tertile_results[i, "Model"],
+                plt_rr_tertile_results[i, "Tertile"],
+                plt_rr_tertile_results[i, "OR"],
+                plt_rr_tertile_results[i, "OR_lower"],
+                plt_rr_tertile_results[i, "OR_upper"],
+                plt_rr_tertile_results[i, "P_display"]))
+  }
+}
+
+cat("\n【趋势检验 (P for trend)】\n")
+for (i in 1:nrow(trend_p)) {
+  cat(sprintf("  %s: P = %.4f\n", trend_p[i, "Model"], trend_p[i, "P_for_trend"]))
+}
+
+cat("\n【模型拟合指标】\n")
+cat(sprintf("  Model 1: AIC = %.1f, R2 = %.3f\n", 
+            model_comparison[1, "AIC"], 
+            model_comparison[1, "R2_McFadden"]))
+cat(sprintf("  Model 2: AIC = %.1f, R2 = %.3f\n", 
+            model_comparison[2, "AIC"], 
+            model_comparison[2, "R2_McFadden"]))
+cat(sprintf("  Model 3: AIC = %.1f, R2 = %.3f, AUC = %.3f\n", 
+            model_comparison[3, "AIC"], 
+            model_comparison[3, "R2_McFadden"],
+            auc(roc_curve)))
+
+cat("\n========================================\n")

@@ -1,0 +1,37 @@
+# 完整代码示例
+library(Boruta)
+library(readxl)
+library(randomForest)
+library(writexl)  # 用于导出Excel
+library(ggplot2)  # 用于高级可视化
+library(dplyr)    # 用于数据处理
+
+# 1. 读取数据
+data <- read_excel("DD.xlsx", sheet = 1)
+
+# 2. 数据预处理
+data_clean <- na.omit(data)
+response_var <- names(data_clean)[ncol(data_clean)]
+data_clean[[response_var]] <- as.factor(data_clean[[response_var]])
+
+# 3. 运行Boruta
+set.seed(123)
+boruta_output <- Boruta(as.formula(paste(response_var, "~ .")), 
+                       data = data_clean, doTrace = 2)
+
+# 4. 处理结果
+boruta_final <- TentativeRoughFix(boruta_output)
+important_features <- getSelectedAttributes(boruta_final)
+
+# 5. 保存结果
+selected_data <- data_clean[, c(important_features, response_var)]
+write_xlsx(selected_data, "selected_features.xlsx")
+
+# 6. 可视化
+plot(boruta_final, cex.axis = 0.7, las = 2, xlab = "", 
+     main = "Selected Features by Boruta")
+
+# 保存为宽幅图片（如PNG）
+png("boruta_plot.png", width = 1200, height = 800, res = 100)  # 宽度1200像素
+plot(boruta_output, cex.axis = 0.7, las = 2, xlab = "")
+dev.off()  # 关闭图形设备

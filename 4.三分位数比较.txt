@@ -1,0 +1,308 @@
+# 加载必要的包
+library(readxl)
+library(tidyverse)
+library(tableone)
+library(rstatix)
+library(ggplot2)
+library(patchwork)
+
+# 读取数据
+data <- read_excel("DD.xlsx", sheet = 1)
+
+# 查看数据结构
+colnames(data)
+
+# 最后一列是Death，重命名
+colnames(data)[ncol(data)] <- "Death"
+
+# 将 Death 转换为因子
+data$Death <- factor(data$Death, levels = c(0, 1), labels = c("Alive", "Dead"))
+
+# ============================================================
+# 1. 对 PLT_RR 进行三分位数分组
+# ============================================================
+
+# 查看PLT_RR的分布
+summary(data$PLT_RR)
+
+# 计算三分位数
+quantiles_plt_rr <- quantile(data$PLT_RR, probs = c(0, 1/3, 2/3, 1), na.rm = TRUE)
+print(quantiles_plt_rr)
+
+# 创建三分位数分组
+data$PLT_RR_tertile <- cut(data$PLT_RR, 
+                           breaks = quantiles_plt_rr, 
+                           include.lowest = TRUE,
+                           labels = c("T1 (Low)", "T2 (Medium)", "T3 (High)"))
+
+# 检查分组分布
+table(data$PLT_RR_tertile)
+
+# ============================================================
+# 2. 三组之间的死亡率比较（重点！）
+# ============================================================
+
+# 2.1 计算各组的死亡率和生存率
+death_table <- table(data$PLT_RR_tertile, data$Death)
+print(death_table)
+
+# 计算各组的死亡率
+death_prop <- prop.table(death_table, margin = 1) * 100
+print(death_prop)
+
+# 创建死亡率的汇总表
+death_summary <- data.frame(
+  Group = rownames(death_table),
+  Alive = death_table[, "Alive"],
+  Dead = death_table[, "Dead"],
+  Total = rowSums(death_table),
+  Mortality_Rate = round(death_prop[, "Dead"], 2)
+)
+print(death_summary)
+
+# 2.2 卡方检验比较三组死亡率
+chisq_test_death <- chisq.test(death_table)
+print(chisq_test_death)
+
+# 如果卡方检验显著，进行两两比较
+if (chisq_test_death$p.value < 0.05) {
+  cat("\n卡方检验显著，进行两两比较...\n")
+  
+  # 两两比较函数
+  pairwise_death_comparison <- function(data, group_var, outcome_var) {
+    groups <- levels(data[[group_var]])
+    results <- data.frame(
+      Group1 = character(),
+      Group2 = character(),
+      P_value = numeric(),
+      stringsAsFactors = FALSE
+    )
+    
+    for (i in 1:(length(groups)-1)) {
+      for (j in (i+1):length(groups)) {
+        subset_data <- data[data[[group_var]] %in% c(groups[i], groups[j]), ]
+        tbl <- table(subset_data[[group_var]], subset_data[[outcome_var]])
+        test <- chisq.test(tbl)
+        results <- rbind(results, data.frame(
+          Group1 = groups[i],
+          Group2 = groups[j],
+          P_value = test$p.value
+        ))
+      }
+    }
+    return(results)
+  }
+  
+  pairwise_death <- pairwise_death_comparison(data, "PLT_RR_tertile", "Death")
+  # 应用Bonferroni校正
+  pairwise_death$P_adjusted <- p.adjust(pairwise_death$P_value, method = "bonferroni")
+  pairwise_death$Significant <- pairwise_death$P_adjusted < 0.05
+  print(pairwise_death)
+}
+
+# ============================================================
+# 3. 比较三组之间在其他指标上的差异（包括Death）
+# ============================================================
+
+# 获取所有列名，排除分组变量和PLT_RR本身
+all_vars <- colnames(data)
+exclude_vars <- c("PLT_RR", "PLT_RR_tertile")
+vars_to_compare <- setdiff(all_vars, exclude_vars)
+
+# 分类变量列表（包括Death）
+catVars <- c("Infection site", "Sex", "ABO", "Rh", "hypertension", "CHD", "DM", 
+             "Smoking", "Alcohol", "Culture result", "Death")
+
+# 检查哪些分类变量存在
+catVars_exist <- catVars[catVars %in% colnames(data)]
+
+# 创建TableOne比较三组（包含Death）
+tab_tertile <- CreateTableOne(
+  vars = vars_to_compare,
+  strata = "PLT_RR_tertile",
+  data = data,
+  factorVars = catVars_exist,
+  includeNA = TRUE,
+  test = TRUE  # 自动进行组间比较检验
+)
+
+# 打印表格
+print(tab_tertile, showAllLevels = TRUE, formatOptions = list(big.mark = ","))
+
+# 导出为CSV
+tab_tertile_matrix <- print(tab_tertile, showAllLevels = TRUE, formatOptions = list(big.mark = ","))
+write.csv(tab_tertile_matrix, "PLT_RR_tertile_comparison.csv")
+cat("三分位数比较表已保存为 PLT_RR_tertile_comparison.csv\n")
+
+# ============================================================
+# 4. 详细的统计分析
+# ============================================================
+
+# 创建函数来对每个变量进行三组比较
+compare_by_tertile <- function(data, var, group_var) {
+  # 检查是否为数值变量
+  if (is.numeric(data[[var]])) {
+    # 使用Kruskal-Wallis检验
+    tryCatch({
+      test <- kruskal.test(as.formula(paste(var, "~", group_var)), data = data)
+      p_val <- test$p.value
+      method <- "Kruskal-Wallis"
+      return(data.frame(Variable = var, P_value = p_val, Method = method, Type = "Numeric"))
+    }, error = function(e) {
+      return(data.frame(Variable = var, P_value = NA, Method = "Error", Type = "Numeric"))
+    })
+  } else {
+    # 分类变量使用卡方检验
+    tryCatch({
+      tbl <- table(data[[var]], data[[group_var]])
+      if (any(chisq.test(tbl)$expected < 5)) {
+        test <- fisher.test(tbl, simulate.p.value = TRUE)
+        p_val <- test$p.value
+        method <- "Fisher's Exact"
+      } else {
+        test <- chisq.test(tbl)
+        p_val <- test$p.value
+        method <- "Chi-square"
+      }
+      return(data.frame(Variable = var, P_value = p_val, Method = method, Type = "Categorical"))
+    }, error = function(e) {
+      return(data.frame(Variable = var, P_value = NA, Method = "Error", Type = "Categorical"))
+    })
+  }
+}
+
+# 对每个变量进行检验（包括Death）
+results_list <- list()
+for (var in vars_to_compare) {
+  if (var %in% colnames(data) && var != "PLT_RR_tertile") {
+    result <- compare_by_tertile(data, var, "PLT_RR_tertile")
+    results_list[[var]] <- result
+  }
+}
+
+# 合并结果
+results_df <- do.call(rbind, results_list)
+
+# 添加FDR校正
+results_df$P_adjusted <- p.adjust(results_df$P_value, method = "fdr")
+results_df$Significant <- results_df$P_adjusted < 0.05
+
+# 按P值排序
+results_df <- results_df[order(results_df$P_value), ]
+
+# 突出显示Death的结果
+print("Death变量的统计检验结果：")
+print(results_df[results_df$Variable == "Death", ])
+
+print("\n所有变量的统计检验结果（按P值排序）：")
+print(results_df)
+
+# 导出详细的检验结果
+write.csv(results_df, "PLT_RR_tertile_statistical_tests.csv", row.names = FALSE)
+cat("详细统计检验结果已保存为 PLT_RR_tertile_statistical_tests.csv\n")
+
+# ============================================================
+# 5. 可视化展示 - 包含Death的条形图
+# ============================================================
+
+# 5.1 死亡率条形图
+death_plot <- ggplot(death_summary, aes(x = Group, y = Mortality_Rate, fill = Group)) +
+  geom_bar(stat = "identity", width = 0.6) +
+  geom_text(aes(label = paste0(Dead, "/", Total, "\n", round(Mortality_Rate, 1), "%")), 
+            vjust = -0.5, size = 4) +
+  scale_fill_manual(values = c("#4CAF50", "#FFC107", "#F44336")) +
+  labs(title = "Mortality Rate by PLT_RR Tertile",
+       x = "PLT_RR Tertile Group",
+       y = "Mortality Rate (%)") +
+  theme_minimal() +
+  theme(legend.position = "none",
+        plot.title = element_text(hjust = 0.5, size = 14),
+        axis.title = element_text(size = 12))
+
+# 添加统计显著性标注
+p_val_text <- paste0("P = ", round(chisq_test_death$p.value, 4))
+if (chisq_test_death$p.value < 0.001) {
+  p_val_text <- "P < 0.001"
+}
+
+death_plot <- death_plot + 
+  annotate("text", x = 2, y = max(death_summary$Mortality_Rate) * 1.1, 
+           label = p_val_text, size = 5, fontface = "bold")
+
+ggsave("PLT_RR_tertile_mortality.png", death_plot, width = 6, height = 5, dpi = 300)
+cat("死亡率条形图已保存为 PLT_RR_tertile_mortality.png\n")
+
+# 5.2 其他关键变量的箱线图
+key_vars <- c("Age", "WBC", "Lymphocyte", "Neutrophil", "CRP", "Ddimer", "Albumin", "SII")
+
+plots <- list()
+for (i in seq_along(key_vars)) {
+  var <- key_vars[i]
+  if (var %in% colnames(data) && is.numeric(data[[var]])) {
+    p <- ggplot(data, aes(x = PLT_RR_tertile, y = .data[[var]], fill = PLT_RR_tertile)) +
+      geom_boxplot(outlier.size = 0.5) +
+      scale_fill_manual(values = c("#4CAF50", "#FFC107", "#F44336")) +
+      labs(title = var, x = "PLT_RR Tertile", y = var) +
+      theme_minimal() +
+      theme(legend.position = "none", 
+            axis.text.x = element_text(angle = 45, hjust = 1),
+            plot.title = element_text(size = 10))
+    
+    # 添加统计显著性标记
+    p <- p + stat_compare_means(comparisons = list(c("T1 (Low)", "T2 (Medium)"),
+                                                    c("T1 (Low)", "T3 (High)"),
+                                                    c("T2 (Medium)", "T3 (High)")),
+                                method = "wilcox.test",
+                                label = "p.signif",
+                                size = 3)
+    plots[[i]] <- p
+  }
+}
+
+# 组合图形
+combined_plot <- wrap_plots(plots, ncol = 3)
+ggsave("PLT_RR_tertile_key_variables.png", combined_plot, width = 15, height = 12, dpi = 300)
+cat("关键变量箱线图已保存为 PLT_RR_tertile_key_variables.png\n")
+
+# ============================================================
+# 6. 汇总报告
+# ============================================================
+
+cat("\n========================================\n")
+cat("PLT_RR三分位数分组分析报告\n")
+cat("========================================\n\n")
+
+cat("1. 三分位数分组情况：\n")
+cat(sprintf("   T1 (Low): %.2f - %.2f (n = %d)\n", 
+    quantiles_plt_rr[1], quantiles_plt_rr[2], sum(data$PLT_RR_tertile == "T1 (Low)", na.rm = TRUE))
+cat(sprintf("   T2 (Medium): %.2f - %.2f (n = %d)\n", 
+    quantiles_plt_rr[2], quantiles_plt_rr[3], sum(data$PLT_RR_tertile == "T2 (Medium)", na.rm = TRUE))
+cat(sprintf("   T3 (High): %.2f - %.2f (n = %d)\n", 
+    quantiles_plt_rr[3], quantiles_plt_rr[4], sum(data$PLT_RR_tertile == "T3 (High)", na.rm = TRUE))
+
+cat("\n2. 死亡率比较：\n")
+cat(sprintf("   T1 (Low): %.1f%% (%d/%d)\n", 
+    death_summary[1, "Mortality_Rate"], death_summary[1, "Dead"], death_summary[1, "Total"])
+cat(sprintf("   T2 (Medium): %.1f%% (%d/%d)\n", 
+    death_summary[2, "Mortality_Rate"], death_summary[2, "Dead"], death_summary[2, "Total"])
+cat(sprintf("   T3 (High): %.1f%% (%d/%d)\n", 
+    death_summary[3, "Mortality_Rate"], death_summary[3, "Dead"], death_summary[3, "Total"])
+cat(sprintf("   卡方检验 P = %.4f\n", chisq_test_death$p.value))
+
+cat("\n3. 显著差异的变量（P < 0.05）：\n")
+sig_vars <- results_df[results_df$Significant == TRUE & !is.na(results_df$Significant), ]
+if (nrow(sig_vars) > 0) {
+  for (i in 1:nrow(sig_vars)) {
+    cat(sprintf("   %s (P = %.4f, %s)\n", 
+        sig_vars[i, "Variable"], sig_vars[i, "P_adjusted"], sig_vars[i, "Method"]))
+  }
+} else {
+  cat("   无显著差异的变量\n")
+}
+
+cat("\n========================================\n")
+cat("分析完成！生成的文件：\n")
+cat("1. PLT_RR_tertile_comparison.csv - 三分位数基线特征比较表（含Death）\n")
+cat("2. PLT_RR_tertile_statistical_tests.csv - 详细统计检验结果（含Death）\n")
+cat("3. PLT_RR_tertile_mortality.png - 死亡率条形图\n")
+cat("4. PLT_RR_tertile_key_variables.png - 关键变量箱线图\n")

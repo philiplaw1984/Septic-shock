@@ -1,0 +1,310 @@
+# ============================================================
+# 多因素Logistic回归分析 - PLT_RR与Death（3个模型）
+# ============================================================
+
+# 加载必要的包
+library(readxl)
+library(tidyverse)
+library(broom)
+library(car)
+library(pROC)
+library(ggplot2)
+library(forestplot)
+
+# 读取数据
+data <- read_excel("DD.xlsx", sheet = 1)
+colnames(data)[ncol(data)] <- "Death"
+
+# ============================================================
+# 1. 数据预处理
+# ============================================================
+
+data$Death_binary <- data$Death
+
+# 将分类变量转换为因子
+categorical_vars <- c("Infection site", "Sex", "ABO", "Rh", "hypertension", 
+                      "CHD", "DM", "Smoking", "Alcohol", "Culture result")
+
+for (var in categorical_vars) {
+  if (var %in% colnames(data)) {
+    data[[var]] <- as.factor(data[[var]])
+  }
+}
+
+# 删除缺失值（如果有）
+data_complete <- data[complete.cases(data[, c("PLT_RR", "Death_binary", "Age", "Sex", 
+                                               "hypertension", "CHD", "DM", "Smoking",
+                                               "BUN", "Scr", "Albumin", "Hemoglobin")]), ]
+
+cat("原始样本量:", nrow(data), "\n")
+cat("完整样本量:", nrow(data_complete), "\n")
+cat("死亡人数:", sum(data_complete$Death_binary == 1), "\n")
+cat("存活人数:", sum(data_complete$Death_binary == 0), "\n\n")
+
+# ============================================================
+# 2. 构建3个多因素Logistic回归模型
+# ============================================================
+
+# -------- Model 1: 未调整（仅PLT_RR） --------
+model1 <- glm(Death_binary ~ PLT_RR, 
+              data = data_complete, 
+              family = binomial(link = "logit"))
+
+# -------- Model 2: 调整人口学特征 + 合并症 --------
+model2 <- glm(Death_binary ~ PLT_RR + Age + Sex + hypertension + CHD + DM + Smoking, 
+              data = data_complete, 
+              family = binomial(link = "logit"))
+
+# -------- Model 3: 调整人口学 + 合并症 + 重要实验室指标 --------
+# 选择单因素分析中P<0.01且临床重要的变量，避免过拟合
+model3 <- glm(Death_binary ~ PLT_RR + Age + Sex + hypertension + CHD + DM + Smoking +
+                BUN + Scr + Albumin + Hemoglobin,
+              data = data_complete, 
+              family = binomial(link = "logit"))
+
+# 将所有模型放入列表
+models <- list(
+  "Model 1 (Unadjusted)" = model1,
+  "Model 2 (+ Demographics & Comorbidities)" = model2,
+  "Model 3 (+ Important Labs)" = model3
+)
+
+# ============================================================
+# 3. 提取PLT_RR在各模型中的结果
+# ============================================================
+
+extract_plt_rr <- function(model, model_name) {
+  summary_model <- summary(model)
+  coef_df <- as.data.frame(summary_model$coefficients)
+  
+  if ("PLT_RR" %in% rownames(coef_df)) {
+    idx <- which(rownames(coef_df) == "PLT_RR")
+    data.frame(
+      Model = model_name,
+      OR = exp(coef_df[idx, "Estimate"]),
+      OR_lower = exp(coef_df[idx, "Estimate"] - 1.96 * coef_df[idx, "Std. Error"]),
+      OR_upper = exp(coef_df[idx, "Estimate"] + 1.96 * coef_df[idx, "Std. Error"]),
+      P_value = coef_df[idx, "Pr(>|z|)"],
+      AIC = AIC(model)
+    )
+  }
+}
+
+# 提取结果
+plt_rr_results <- do.call(rbind, lapply(names(models), function(name) {
+  extract_plt_rr(models[[name]], name)
+}))
+
+# 格式化P值
+plt_rr_results$P_display <- ifelse(plt_rr_results$P_value < 0.001, "<0.001", 
+                                    round(plt_rr_results$P_value, 4))
+plt_rr_results$OR_CI <- sprintf("%.3f (%.3f - %.3f)", 
+                                 plt_rr_results$OR, 
+                                 plt_rr_results$OR_lower, 
+                                 plt_rr_results$OR_upper)
+
+cat("\n====== PLT_RR在多因素模型中的结果 ======\n")
+print(plt_rr_results[, c("Model", "OR_CI", "P_display", "AIC")])
+
+# ============================================================
+# 4. 完整模型（Model 3）的所有变量结果
+# ============================================================
+
+extract_all_vars <- function(model, model_name) {
+  summary_model <- summary(model)
+  coef_df <- as.data.frame(summary_model$coefficients)
+  
+  results <- data.frame(
+    Variable = rownames(coef_df),
+    Beta = coef_df[, "Estimate"],
+    SE = coef_df[, "Std. Error"],
+    Wald_Z = coef_df[, "z value"],
+    P_value = coef_df[, "Pr(>|z|)"],
+    OR = exp(coef_df[, "Estimate"]),
+    OR_lower = exp(coef_df[, "Estimate"] - 1.96 * coef_df[, "Std. Error"]),
+    OR_upper = exp(coef_df[, "Estimate"] + 1.96 * coef_df[, "Std. Error"])
+  )
+  
+  results <- results[results$Variable != "(Intercept)", ]
+  results$Significant <- ifelse(results$P_value < 0.001, "***",
+                                ifelse(results$P_value < 0.01, "**",
+                                       ifelse(results$P_value < 0.05, "*", "")))
+  results$Model <- model_name
+  
+  return(results)
+}
+
+model3_full <- extract_all_vars(model3, "Model 3")
+
+cat("\n====== Model 3 完整结果 ======\n")
+print(model3_full[, c("Variable", "OR", "OR_lower", "OR_upper", "P_value", "Significant")])
+
+# ============================================================
+# 5. 模型比较
+# ============================================================
+
+model_comparison <- data.frame(
+  Model = names(models),
+  AIC = sapply(models, AIC),
+  BIC = sapply(models, BIC),
+  LogLik = sapply(models, logLik),
+  DF = sapply(models, df.residual)
+)
+
+# 计算Pseudo R-squared (McFadden)
+for (i in 1:length(models)) {
+  null_model <- glm(Death_binary ~ 1, data = data_complete, family = binomial)
+  model_comparison[i, "R2_McFadden"] <- 1 - logLik(models[[i]])/logLik(null_model)
+}
+
+cat("\n====== 模型比较 ======\n")
+print(model_comparison)
+
+# ============================================================
+# 6. 模型诊断
+# ============================================================
+
+cat("\n====== 共线性诊断 (VIF) ======\n")
+vif_values <- vif(model3)
+print(vif_values)
+
+# 检查高共线性
+high_vif <- names(vif_values[vif_values > 5])
+if (length(high_vif) > 0) {
+  cat("\n警告：以下变量VIF > 5，可能存在共线性问题：\n")
+  print(high_vif)
+}
+
+# ROC曲线
+pred_probs <- predict(model3, type = "response")
+roc_curve <- roc(data_complete$Death_binary, pred_probs)
+cat(sprintf("\nModel 3 AUC: %.3f (95%% CI: %.3f - %.3f)\n", 
+            auc(roc_curve),
+            ci.auc(roc_curve)[1],
+            ci.auc(roc_curve)[3]))
+
+# ============================================================
+# 7. 可视化
+# ============================================================
+
+# 7.1 PLT_RR跨模型的森林图
+forest_plot_plt <- ggplot(plt_rr_results, aes(x = OR, y = reorder(Model, -OR))) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "gray50", size = 1) +
+  geom_errorbarh(aes(xmin = OR_lower, xmax = OR_upper), 
+                 height = 0.2, color = "steelblue", size = 1.2) +
+  geom_point(aes(color = P_value < 0.05), size = 4) +
+  scale_color_manual(values = c("TRUE" = "#E74C3C", "FALSE" = "#2C3E50"),
+                     labels = c("TRUE" = "P < 0.05", "FALSE" = "P ≥ 0.05")) +
+  scale_x_log10(breaks = c(0.5, 0.8, 1, 1.2, 1.5, 2)) +
+  labs(title = "PLT_RR and Risk of Death: Multivariable Logistic Regression",
+       x = "Odds Ratio (95% CI) for PLT_RR",
+       y = "",
+       color = "Significance") +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.y = element_text(size = 11),
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    legend.position = "top"
+  )
+
+ggsave("PLT_RR_multivariable_models.png", forest_plot_plt, width = 8, height = 5, dpi = 300)
+
+# 7.2 Model 3 ROC曲线
+png("model3_roc_curve.png", width = 800, height = 700)
+plot(roc_curve, main = paste("Model 3 ROC Curve (AUC =", round(auc(roc_curve), 3), ")"))
+dev.off()
+
+# 7.3 Model 3 所有变量的森林图
+forest_data <- model3_full
+forest_data$Variable_clean <- gsub("Infection site", "Infection_", forest_data$Variable)
+forest_data$Variable_clean <- gsub("Sex", "Sex_", forest_data$Variable_clean)
+
+forest_all <- ggplot(forest_data, aes(x = OR, y = reorder(Variable, OR))) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "gray50") +
+  geom_errorbarh(aes(xmin = OR_lower, xmax = OR_upper), 
+                 height = 0.2, color = "steelblue", size = 0.8) +
+  geom_point(aes(color = P_value < 0.05), size = 3) +
+  scale_color_manual(values = c("TRUE" = "red", "FALSE" = "steelblue"),
+                     labels = c("TRUE" = "P < 0.05", "FALSE" = "P ≥ 0.05")) +
+  scale_x_log10() +
+  labs(title = "Model 3: All Variables",
+       x = "Odds Ratio (95% CI)",
+       y = "") +
+  theme_minimal() +
+  theme(axis.text.y = element_text(size = 8))
+
+ggsave("model3_all_variables_forest.png", forest_all, width = 10, height = 8, dpi = 300)
+
+# ============================================================
+# 8. 保存结果
+# ============================================================
+
+write.csv(plt_rr_results, "PLT_RR_multivariable_results.csv", row.names = FALSE)
+write.csv(model3_full, "model3_full_results.csv", row.names = FALSE)
+write.csv(model_comparison, "model_comparison.csv", row.names = FALSE)
+
+cat("\n生成的文件:\n")
+cat("1. PLT_RR_multivariable_results.csv - PLT_RR跨模型结果\n")
+cat("2. model3_full_results.csv - Model 3完整结果\n")
+cat("3. model_comparison.csv - 模型比较\n")
+cat("4. PLT_RR_multivariable_models.png - PLT_RR森林图\n")
+cat("5. model3_roc_curve.png - ROC曲线\n")
+cat("6. model3_all_variables_forest.png - Model 3所有变量森林图\n")
+
+# ============================================================
+# 9. 最终报告
+# ============================================================
+
+cat("\n========================================\n")
+cat("PLT_RR与死亡风险多因素分析报告\n")
+cat("========================================\n\n")
+
+cat("【研究设计】\n")
+cat("  研究变量: PLT_RR (血小板/呼吸频率比值)\n")
+cat("  结局事件: Death (住院期间死亡)\n")
+cat("  样本量:", nrow(data_complete), "\n")
+cat("  死亡人数:", sum(data_complete$Death_binary == 1), 
+    "(", round(sum(data_complete$Death_binary == 1)/nrow(data_complete)*100, 1), "%)\n\n")
+
+cat("【模型构建策略】\n")
+cat("  Model 1: 未调整（仅PLT_RR）\n")
+cat("  Model 2: 调整 Age, Sex, hypertension, CHD, DM, Smoking\n")
+cat("  Model 3: 调整 Model 2 + BUN, Scr, Albumin, Hemoglobin\n\n")
+
+cat("【PLT_RR在各模型中的OR值】\n")
+for (i in 1:nrow(plt_rr_results)) {
+  cat(sprintf("  %s: OR = %.3f (95%% CI: %.3f - %.3f), P = %s\n",
+              plt_rr_results[i, "Model"],
+              plt_rr_results[i, "OR"],
+              plt_rr_results[i, "OR_lower"],
+              plt_rr_results[i, "OR_upper"],
+              plt_rr_results[i, "P_display"]))
+}
+
+cat("\n【Model 3 中显著预测因素 (P < 0.05)】\n")
+sig_vars <- model3_full[model3_full$P_value < 0.05, ]
+if (nrow(sig_vars) > 0) {
+  for (i in 1:nrow(sig_vars)) {
+    cat(sprintf("  %s: OR = %.3f (95%% CI: %.3f - %.3f), P = %.4f %s\n",
+                sig_vars[i, "Variable"],
+                sig_vars[i, "OR"],
+                sig_vars[i, "OR_lower"],
+                sig_vars[i, "OR_upper"],
+                sig_vars[i, "P_value"],
+                sig_vars[i, "Significant"]))
+  }
+}
+
+cat("\n【模型拟合指标】\n")
+cat(sprintf("  Model 1: AIC = %.1f, R2 = %.3f\n", 
+            model_comparison[1, "AIC"], 
+            model_comparison[1, "R2_McFadden"]))
+cat(sprintf("  Model 2: AIC = %.1f, R2 = %.3f\n", 
+            model_comparison[2, "AIC"], 
+            model_comparison[2, "R2_McFadden"]))
+cat(sprintf("  Model 3: AIC = %.1f, R2 = %.3f, AUC = %.3f\n", 
+            model_comparison[3, "AIC"], 
+            model_comparison[3, "R2_McFadden"],
+            auc(roc_curve)))
+
+cat("\n========================================\n")

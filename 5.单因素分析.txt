@@ -1,0 +1,386 @@
+# 加载必要的包
+library(readxl)
+library(tidyverse)
+library(broom)
+library(forestplot)
+library(ggplot2)
+library(patchwork)
+library(tableone)
+
+# 读取数据
+data <- read_excel("DD.xlsx", sheet = 1)
+
+# 重命名最后一列为Death
+colnames(data)[ncol(data)] <- "Death"
+
+# 查看数据结构
+str(data)
+colnames(data)
+
+# ============================================================
+# 1. 数据预处理
+# ============================================================
+
+# 将Death转换为二分类数值变量（0/1）
+data$Death_binary <- data$Death
+
+# 将分类变量转换为因子
+categorical_vars <- c("Infection site", "Sex", "ABO", "Rh", "hypertension", "CHD", "DM", 
+                      "Smoking", "Alcohol", "Culture result")
+
+for (var in categorical_vars) {
+  if (var %in% colnames(data)) {
+    data[[var]] <- as.factor(data[[var]])
+  }
+}
+
+# 查看死亡分布
+table(data$Death_binary)
+prop.table(table(data$Death_binary)) * 100
+
+# ============================================================
+# 2. 单因素Logistic回归分析（包含所有变量）
+# ============================================================
+
+# 获取所有变量（排除Death_binary和Death）
+all_vars <- colnames(data)
+exclude_vars <- c("Death_binary", "Death")  # 只排除结局变量本身
+vars_for_univariate <- setdiff(all_vars, exclude_vars)
+
+cat("纳入单因素分析的变量数量:", length(vars_for_univariate), "\n")
+cat("变量列表:", paste(vars_for_univariate, collapse = ", "), "\n")
+
+# 单因素Logistic回归函数
+univariate_logistic <- function(data, var, outcome = "Death_binary") {
+  # 检查变量是否存在
+  if (!var %in% colnames(data)) {
+    return(NULL)
+  }
+  
+  # 检查变量是否有足够的变异
+  if (length(unique(na.omit(data[[var]]))) < 2) {
+    return(NULL)
+  }
+  
+  # 检查是否有足够的样本
+  if (sum(!is.na(data[[var]])) < 10) {
+    return(NULL)
+  }
+  
+  # 构建公式
+  formula <- as.formula(paste(outcome, "~", var))
+  
+  # 尝试拟合模型
+  tryCatch({
+    model <- glm(formula, data = data, family = binomial(link = "logit"))
+    
+    # 提取结果
+    summary_model <- summary(model)
+    coef_df <- as.data.frame(summary_model$coefficients)
+    
+    # 提取感兴趣的统计量（排除截距）
+    if (nrow(coef_df) > 1) {
+      # 对于分类变量，提取所有水平的OR
+      results <- data.frame(
+        Variable = var,
+        Level = rownames(coef_df)[-1],
+        Beta = coef_df[-1, "Estimate"],
+        SE = coef_df[-1, "Std. Error"],
+        Z = coef_df[-1, "z value"],
+        P_value = coef_df[-1, "Pr(>|z|)"],
+        OR = exp(coef_df[-1, "Estimate"]),
+        OR_lower = exp(coef_df[-1, "Estimate"] - 1.96 * coef_df[-1, "Std. Error"]),
+        OR_upper = exp(coef_df[-1, "Estimate"] + 1.96 * coef_df[-1, "Std. Error"])
+      )
+      
+      # 对于二分类变量，添加整体P值
+      if (nrow(results) == 1) {
+        results$Overall_P <- coef_df[-1, "Pr(>|z|)"]
+      } else {
+        # 使用ANOVA比较模型
+        null_model <- glm(as.formula(paste(outcome, "~ 1")), data = data, family = binomial)
+        anova_result <- anova(null_model, model, test = "Chisq")
+        results$Overall_P <- anova_result[2, "Pr(>Chi)"]
+      }
+      
+      return(results)
+    } else {
+      return(NULL)
+    }
+  }, error = function(e) {
+    return(NULL)
+  })
+}
+
+# 对所有变量进行单因素分析（包括所有衍生变量）
+univariate_results <- list()
+failed_vars <- c()
+
+for (var in vars_for_univariate) {
+  cat("正在分析变量:", var, "\n")
+  result <- univariate_logistic(data, var)
+  if (!is.null(result) && nrow(result) > 0) {
+    univariate_results[[var]] <- result
+  } else {
+    failed_vars <- c(failed_vars, var)
+  }
+}
+
+# 报告未能分析的变量
+if (length(failed_vars) > 0) {
+  cat("\n以下变量未能成功分析:", paste(failed_vars, collapse = ", "), "\n")
+}
+
+# 合并所有结果
+if (length(univariate_results) > 0) {
+  all_univariate <- do.call(rbind, univariate_results)
+  
+  # 添加FDR校正
+  all_univariate$P_adjusted <- p.adjust(all_univariate$P_value, method = "fdr")
+  all_univariate$Significant <- all_univariate$P_adjusted < 0.05
+  
+  # 按P值排序
+  all_univariate <- all_univariate[order(all_univariate$P_value), ]
+  
+  # 保存结果
+  write.csv(all_univariate, "univariate_analysis_death_all_vars.csv", row.names = FALSE)
+  cat("\n单因素分析结果已保存为 univariate_analysis_death_all_vars.csv\n")
+  
+  # 显示显著变量
+  sig_results <- all_univariate[all_univariate$Significant == TRUE, ]
+  cat("\n显著变量（P < 0.05）：\n")
+  print(sig_results[, c("Variable", "Level", "OR", "OR_lower", "OR_upper", "P_value", "P_adjusted")])
+  
+  # 特别显示衍生变量的结果
+  derived_vars <- c("PLT_RR", "PLT_LYM", "PLT_RDW", "PLT_MPV", "SII", "PLT_ALB")
+  cat("\n\n衍生变量的单因素分析结果：\n")
+  derived_results <- all_univariate[all_univariate$Variable %in% derived_vars, ]
+  if (nrow(derived_results) > 0) {
+    print(derived_results[, c("Variable", "Level", "OR", "OR_lower", "OR_upper", "P_value", "Significant")])
+  } else {
+    cat("无衍生变量结果\n")
+  }
+}
+
+# ============================================================
+# 3. 单因素分析表格（含更多统计信息）
+# ============================================================
+
+# 创建更详细的单因素分析表格
+create_univariate_table <- function(data, vars, outcome = "Death_binary") {
+  results_list <- list()
+  
+  for (var in vars) {
+    if (!var %in% colnames(data)) next
+    
+    # 检查是否为分类变量
+    if (is.factor(data[[var]]) || is.character(data[[var]])) {
+      data[[var]] <- as.factor(data[[var]])
+      levels_var <- levels(data[[var]])
+      
+      for (i in 2:length(levels_var)) {
+        # 创建二分类变量
+        temp_data <- data
+        temp_data$var_binary <- ifelse(temp_data[[var]] == levels_var[i], 1, 0)
+        
+        # 计算OR
+        tryCatch({
+          model <- glm(as.formula(paste(outcome, "~ var_binary")), 
+                       data = temp_data, family = binomial)
+          coef_sum <- summary(model)$coefficients
+          
+          if (nrow(coef_sum) > 1) {
+            results_list[[paste0(var, "_", levels_var[i])]] <- data.frame(
+              Variable = var,
+              Level = levels_var[i],
+              Reference = levels_var[1],
+              N = sum(!is.na(temp_data[[var]])),
+              Events = sum(temp_data[[var]] == levels_var[i] & temp_data[[outcome]] == 1, na.rm = TRUE),
+              OR = exp(coef_sum[2, "Estimate"]),
+              CI_lower = exp(coef_sum[2, "Estimate"] - 1.96 * coef_sum[2, "Std. Error"]),
+              CI_upper = exp(coef_sum[2, "Estimate"] + 1.96 * coef_sum[2, "Std. Error"]),
+              P_value = coef_sum[2, "Pr(>|z|)"]
+            )
+          }
+        }, error = function(e) {})
+      }
+    } else if (is.numeric(data[[var]])) {
+      # 数值变量
+      tryCatch({
+        model <- glm(as.formula(paste(outcome, "~", var)), 
+                     data = data, family = binomial)
+        coef_sum <- summary(model)$coefficients
+        
+        if (nrow(coef_sum) > 1) {
+          results_list[[var]] <- data.frame(
+            Variable = var,
+            Level = "per 1 unit increase",
+            Reference = NA,
+            N = sum(!is.na(data[[var]])),
+            Events = sum(data[[var]] & data[[outcome]] == 1, na.rm = TRUE),
+            OR = exp(coef_sum[2, "Estimate"]),
+            CI_lower = exp(coef_sum[2, "Estimate"] - 1.96 * coef_sum[2, "Std. Error"]),
+            CI_upper = exp(coef_sum[2, "Estimate"] + 1.96 * coef_sum[2, "Std. Error"]),
+            P_value = coef_sum[2, "Pr(>|z|)"]
+          )
+        }
+      }, error = function(e) {})
+    }
+  }
+  
+  if (length(results_list) > 0) {
+    results_df <- do.call(rbind, results_list)
+    results_df$P_adjusted <- p.adjust(results_df$P_value, method = "fdr")
+    results_df$Significant <- results_df$P_adjusted < 0.05
+    return(results_df)
+  } else {
+    return(NULL)
+  }
+}
+
+# 执行单因素分析（包含所有变量）
+univariate_table <- create_univariate_table(data, vars_for_univariate)
+
+if (!is.null(univariate_table)) {
+  # 按P值排序
+  univariate_table <- univariate_table[order(univariate_table$P_value), ]
+  
+  # 保存为CSV
+  write.csv(univariate_table, "univariate_table_death_all_vars.csv", row.names = FALSE)
+  cat("单因素分析详细表格已保存为 univariate_table_death_all_vars.csv\n")
+  
+  # 显示结果
+  cat("\n====== 单因素分析结果（所有变量） ======\n")
+  print(univariate_table[, c("Variable", "Level", "OR", "CI_lower", "CI_upper", "P_value", "Significant")])
+}
+
+# ============================================================
+# 4. 森林图可视化（包含所有显著变量）
+# ============================================================
+
+# 选择P < 0.1的变量进行可视化
+if (!is.null(univariate_table)) {
+  plot_vars <- univariate_table[univariate_table$P_value < 0.1, ]
+  
+  if (nrow(plot_vars) > 0) {
+    # 准备森林图数据
+    forest_data <- plot_vars %>%
+      mutate(
+        Variable_Level = ifelse(is.na(Level), Variable, paste0(Variable, ": ", Level)),
+        OR_display = round(OR, 2),
+        CI_display = paste0(round(CI_lower, 2), "-", round(CI_upper, 2)),
+        P_display = ifelse(P_value < 0.001, "<0.001", round(P_value, 4))
+      )
+    
+    # 创建森林图
+    forest_plot <- ggplot(forest_data, aes(x = OR, y = reorder(Variable_Level, OR))) +
+      geom_vline(xintercept = 1, linetype = "dashed", color = "gray50") +
+      geom_errorbarh(aes(xmin = CI_lower, xmax = CI_upper), 
+                     height = 0.2, color = "steelblue", size = 1) +
+      geom_point(aes(color = P_value < 0.05), size = 3) +
+      scale_color_manual(values = c("TRUE" = "red", "FALSE" = "steelblue"),
+                         labels = c("TRUE" = "P < 0.05", "FALSE" = "P ≥ 0.05")) +
+      scale_x_log10() +
+      labs(title = "Univariate Analysis for Death (All Variables)",
+           x = "Odds Ratio (95% CI)",
+           y = "",
+           color = "Significance") +
+      theme_minimal() +
+      theme(
+        axis.text.y = element_text(size = 8),
+        plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+        legend.position = "top"
+      )
+    
+    # 保存森林图
+    ggsave("univariate_forest_plot_death_all_vars.png", forest_plot, width = 12, height = 10, dpi = 300)
+    cat("森林图已保存为 univariate_forest_plot_death_all_vars.png\n")
+    
+    # 显示森林图
+    print(forest_plot)
+  }
+}
+
+# ============================================================
+# 5. 补充：比较死亡组与非死亡组的基线特征（包含所有变量）
+# ============================================================
+
+# 创建TableOne比较死亡组与非死亡组
+vars_for_table <- setdiff(all_vars, c("Death_binary"))  # 包含所有变量
+catVars <- c("Sex", "ABO", "Rh", "hypertension", "CHD", "DM", 
+             "Smoking", "Alcohol", "Culture result")
+
+# 检查分类变量是否存在
+catVars_exist <- catVars[catVars %in% colnames(data)]
+
+# 创建TableOne
+tab_death <- CreateTableOne(
+  vars = vars_for_table,
+  strata = "Death",
+  data = data,
+  factorVars = catVars_exist,
+  includeNA = TRUE,
+  test = TRUE
+)
+
+# 打印表格
+print(tab_death, showAllLevels = TRUE, formatOptions = list(big.mark = ","))
+
+# 导出为CSV
+tab_death_matrix <- print(tab_death, showAllLevels = TRUE, formatOptions = list(big.mark = ","))
+write.csv(tab_death_matrix, "death_vs_alive_comparison_all_vars.csv")
+cat("死亡组与非死亡组比较表（所有变量）已保存为 death_vs_alive_comparison_all_vars.csv\n")
+
+# ============================================================
+# 6. 汇总报告
+# ============================================================
+
+cat("\n========================================\n")
+cat("死亡结局单因素分析报告（包含所有变量）\n")
+cat("========================================\n\n")
+
+cat("1. 总样本量:", nrow(data), "\n")
+cat("2. 死亡人数:", sum(data$Death_binary == 1, na.rm = TRUE), 
+    "(", round(prop.table(table(data$Death_binary))[2] * 100, 1), "%)\n")
+cat("3. 存活人数:", sum(data$Death_binary == 0, na.rm = TRUE), 
+    "(", round(prop.table(table(data$Death_binary))[1] * 100, 1), "%)\n")
+cat("4. 纳入分析的变量数量:", length(vars_for_univariate), "\n\n")
+
+if (!is.null(univariate_table)) {
+  cat("5. 显著预测因素（P < 0.05）：\n")
+  sig_vars <- univariate_table[univariate_table$Significant == TRUE, ]
+  if (nrow(sig_vars) > 0) {
+    for (i in 1:nrow(sig_vars)) {
+      cat(sprintf("   %s: OR = %.2f (95%% CI: %.2f-%.2f), P = %.4f\n",
+          ifelse(is.na(sig_vars[i, "Level"]), sig_vars[i, "Variable"], 
+                 paste0(sig_vars[i, "Variable"], " (", sig_vars[i, "Level"], ")")),
+          sig_vars[i, "OR"], sig_vars[i, "CI_lower"], sig_vars[i, "CI_upper"],
+          sig_vars[i, "P_value"]))
+    }
+  } else {
+    cat("   无显著预测因素\n")
+  }
+  
+  cat("\n6. 衍生变量（PLT_RR, PLT_LYM, PLT_RDW, PLT_MPV, SII, PLT_ALB）结果：\n")
+  derived_vars <- c("PLT_RR", "PLT_LYM", "PLT_RDW", "PLT_MPV", "SII", "PLT_ALB")
+  derived_results <- univariate_table[univariate_table$Variable %in% derived_vars, ]
+  if (nrow(derived_results) > 0) {
+    for (i in 1:nrow(derived_results)) {
+      cat(sprintf("   %s: OR = %.2f (95%% CI: %.2f-%.2f), P = %.4f\n",
+          derived_results[i, "Variable"],
+          derived_results[i, "OR"], 
+          derived_results[i, "CI_lower"], 
+          derived_results[i, "CI_upper"],
+          derived_results[i, "P_value"]))
+    }
+  } else {
+    cat("   无衍生变量结果\n")
+  }
+}
+
+cat("\n========================================\n")
+cat("生成的文件：\n")
+cat("1. univariate_analysis_death_all_vars.csv - 单因素分析汇总结果（所有变量）\n")
+cat("2. univariate_table_death_all_vars.csv - 单因素分析详细表格（所有变量）\n")
+cat("3. death_vs_alive_comparison_all_vars.csv - 死亡组与非死亡组比较（所有变量）\n")
+cat("4. univariate_forest_plot_death_all_vars.png - 森林图（所有变量）\n")
